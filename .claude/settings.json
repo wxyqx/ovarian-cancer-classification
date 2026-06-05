@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(\\(Get-Content e:\\\\wxxyq\\\\templates\\\\index.html -Raw\\) -replace '\\\\r', '' -split '\\\\n' | Select-Object -Index \\(157..161\\) | % { \"[$_]\" })"
+    ]
+  }
+}
