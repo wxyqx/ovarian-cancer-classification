@@ -9,7 +9,6 @@ from monai.transforms import (
     EnsureChannelFirstd,
     ScaleIntensityRanged,
     CropForegroundd,
-    CenterSpatialCropd,
     Resized,
     RandFlipd,
     RandRotate90d,
@@ -21,24 +20,17 @@ from monai.transforms import (
     RandScaleIntensityd,
     RandShiftIntensityd,
     NormalizeIntensityd,
-    SpatialPadd,
     EnsureTyped,
 )
 
-from config import (
-    MIN_HU,
-    MAX_HU,
-    FINAL_SPATIAL_SIZE,
-    FINAL_DEPTH,
-    NUM_WORKERS,
-)
+from config import MIN_HU, MAX_HU, FINAL_SPATIAL_SIZE, NUM_WORKERS
 
 
 def get_train_transforms():
-    """训练数据增强 - 包含MONAI全套增强"""
+    """训练数据增强"""
     return Compose([
         LoadImaged(keys=["image"], image_only=True, ensure_channel_first=True),
-        # CT窗口裁剪
+        # CT窗宽窗位裁剪
         ScaleIntensityRanged(
             keys=["image"],
             a_min=MIN_HU,
@@ -47,31 +39,22 @@ def get_train_transforms():
             b_max=1.0,
             clip=True,
         ),
-        # 去除空气区域
+        # 去空气区域，保持尺寸可被16整除
         CropForegroundd(
             keys=["image"],
             source_key="image",
             margin=10,
-            k_divisible=FINAL_SPATIAL_SIZE[0],
+            k_divisible=16,
         ),
-        # 空间归一化到指定尺寸
+        # 统一缩放到 (H=128, W=128, D=32)
         Resized(
             keys=["image"],
-            spatial_size=FINAL_SPATIAL_SIZE,
-            mode="bilinear",
-            anti_aliasing=True,
-        ),
-        # Z轴padding或裁剪到FINAL_DEPTH
-        SpatialPadd(
-            keys=["image"],
-            spatial_size=(FINAL_SPATIAL_SIZE[0], FINAL_SPATIAL_SIZE[1], -1),
-            mode="constant",
-            constant_values=0.0,
+            spatial_size=(128, 128, 32),
+            mode="trilinear",
         ),
         # MONAI数据增强
         RandFlipd(keys=["image"], prob=0.5, spatial_axis=[0]),
         RandFlipd(keys=["image"], prob=0.5, spatial_axis=[1]),
-        RandFlipd(keys=["image"], prob=0.5, spatial_axis=[2]),
         RandRotate90d(keys=["image"], prob=0.5, spatial_axes=(0, 1)),
         RandAffined(
             keys=["image"],
@@ -113,53 +96,13 @@ def get_val_transforms():
             keys=["image"],
             source_key="image",
             margin=10,
-            k_divisible=FINAL_SPATIAL_SIZE[0],
+            k_divisible=16,
         ),
         Resized(
             keys=["image"],
-            spatial_size=FINAL_SPATIAL_SIZE,
-            mode="bilinear",
-            anti_aliasing=True,
-        ),
-        SpatialPadd(
-            keys=["image"],
-            spatial_size=(FINAL_SPATIAL_SIZE[0], FINAL_SPATIAL_SIZE[1], -1),
-            mode="constant",
-            constant_values=0.0,
+            spatial_size=(128, 128, 32),
+            mode="trilinear",
         ),
         NormalizeIntensityd(keys=["image"], nonzero=True),
         EnsureTyped(keys=["image"], dtype=np.float32),
     ])
-
-
-def get_slice_sampler(volume, target_depth):
-    """
-    智能切片采样器。
-    不是固定抽取N层，而是根据volume的depth动态采样。
-    - 如果depth >= target_depth: 等间隔采样
-    - 如果depth < target_depth: 居中padding
-
-    Args:
-        volume: numpy array, shape (C, H, W, D)
-        target_depth: int, 目标深度
-
-    Returns:
-        sampled_volume: numpy array, shape (C, H, W, target_depth)
-    """
-    depth = volume.shape[-1]
-
-    if depth >= target_depth:
-        # 等间隔采样，覆盖整个depth范围
-        indices = np.linspace(0, depth - 1, target_depth, dtype=int)
-        return volume[..., indices]
-    else:
-        # Padding到target_depth（MONAI SpatialPadd已处理，这里做fallback）
-        pad_total = target_depth - depth
-        pad_before = pad_total // 2
-        pad_after = pad_total - pad_before
-        return np.pad(
-            volume,
-            pad_width=((0, 0), (0, 0), (0, 0), (pad_before, pad_after)),
-            mode="constant",
-            constant_values=0.0,
-        )

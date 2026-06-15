@@ -18,7 +18,7 @@ OUTPUT_DIR = "/kaggle/working/outputs"
 CT_WINDOW_CENTER = 40       # 腹部软组织窗位
 CT_WINDOW_WIDTH = 400       # 腹部软组织窗宽
 FINAL_DEPTH = 32            # 最终深度
-FINAL_SPATIAL_SIZE = (128, 128)  # 最终空间尺寸
+FINAL_SPATIAL_SIZE = (128, 128, -1)  # H,W固定128，D保持原样
 MIN_HU = CT_WINDOW_CENTER - CT_WINDOW_WIDTH // 2
 MAX_HU = CT_WINDOW_CENTER + CT_WINDOW_WIDTH // 2
 
