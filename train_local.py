@@ -1,7 +1,8 @@
-# Ovarian Cancer CT Classification - Lightweight 3D CNN
-# Kaggle + 本地通用版
-
-import os, random, copy, warnings
+"""
+Ovarian Cancer CT Classification - Lightweight 3D CNN
+RTX 4060 8GB - Small model for 149 samples
+"""
+import os, sys, json, random, copy, warnings
 warnings.filterwarnings("ignore")
 
 import numpy as np
@@ -17,15 +18,15 @@ from sklearn.metrics import accuracy_score, roc_auc_score
 from monai.transforms import (
     Compose, LoadImaged, ScaleIntensityRanged, CropForegroundd, Resized,
     RandFlipd, RandRotate90d, RandAffined, RandZoomd, RandGaussianNoised,
-    RandGaussianSmoothd, RandScaleIntensityd, RandShiftIntensityd,
-    NormalizeIntensityd, EnsureTyped,
+    RandAdjustContrastd, RandGaussianSmoothd, RandScaleIntensityd,
+    RandShiftIntensityd, NormalizeIntensityd, EnsureTyped,
 )
 
 # ==========================================
 # Config
 # ==========================================
-DATA_DIR = "/kaggle/input/datasets/aaaxxxiii/luachao/卵巢癌数据"
-OUTPUT_DIR = "/kaggle/working/outputs"
+DATA_DIR = r"E:\download\卵巢癌数据"
+OUTPUT_DIR = r"E:\download\outputs"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 MIN_HU = -160
@@ -38,10 +39,11 @@ WEIGHT_DECAY = 1e-4
 GRAD_CLIP = 1.0
 N_FOLDS = 5
 SEED = 42
-NUM_WORKERS = 2
+NUM_WORKERS = 0
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-print(f"Device: {DEVICE}")
+print(f"Device: {DEVICE} | torch {torch.__version__}")
+print(f"GPU: {torch.cuda.get_device_name(0)} | VRAM: {torch.cuda.get_device_properties(0).total_memory/1e9:.1f}GB")
 
 # ==========================================
 # Transforms
@@ -100,32 +102,46 @@ for fp in all_nii:
 print(f"Samples: {len(files)} (Neg={labels.count(0)} Pos={labels.count(1)})")
 
 # ==========================================
-# Lightweight 3D CNN (~434K params)
+# Lightweight 3D CNN (~300K params)
 # ==========================================
 class Light3DCNN(nn.Module):
     def __init__(self):
         super().__init__()
         self.features = nn.Sequential(
-            nn.Conv3d(1, 16, 3, padding=1), nn.GroupNorm(4, 16), nn.ReLU(), nn.MaxPool3d(2),
+            nn.Conv3d(1, 16, 3, padding=1), nn.GroupNorm(4, 16), nn.ReLU(),
+            nn.MaxPool3d(2),
+
             nn.Conv3d(16, 32, 3, padding=1), nn.GroupNorm(8, 32), nn.ReLU(),
-            nn.Conv3d(32, 32, 3, padding=1), nn.GroupNorm(8, 32), nn.ReLU(), nn.MaxPool3d(2),
+            nn.Conv3d(32, 32, 3, padding=1), nn.GroupNorm(8, 32), nn.ReLU(),
+            nn.MaxPool3d(2),
+
             nn.Conv3d(32, 64, 3, padding=1), nn.GroupNorm(8, 64), nn.ReLU(),
-            nn.Conv3d(64, 64, 3, padding=1), nn.GroupNorm(8, 64), nn.ReLU(), nn.MaxPool3d(2),
+            nn.Conv3d(64, 64, 3, padding=1), nn.GroupNorm(8, 64), nn.ReLU(),
+            nn.MaxPool3d(2),
+
             nn.Conv3d(64, 128, 3, padding=1), nn.GroupNorm(8, 128), nn.ReLU(),
             nn.AdaptiveAvgPool3d((1, 1, 1)),
         )
         self.classifier = nn.Sequential(
-            nn.Dropout(0.5), nn.Linear(128, 32), nn.ReLU(),
-            nn.Dropout(0.3), nn.Linear(32, 2),
+            nn.Dropout(0.5),
+            nn.Linear(128, 32),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(32, 2),
         )
+        self._init_weights()
+
+    def _init_weights(self):
         for m in self.modules():
-            if isinstance(m, nn.Conv3d): nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            if isinstance(m, nn.Conv3d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
 
     def forward(self, x):
-        return self.classifier(self.features(x).view(x.size(0), -1))
+        x = self.features(x)
+        return self.classifier(x.view(x.size(0), -1))
 
 n_params = sum(p.numel() for p in Light3DCNN().parameters())
-print(f"Model: {n_params:,} params")
+print(f"Model params: {n_params:,}")
 
 # ==========================================
 # EMA
@@ -197,13 +213,13 @@ class Trainer:
             vl, va, vau, _, _, _ = self.run_epoch(va_loader, False)
             self.scheduler.step()
             if (ep + 1) % 10 == 0 or ep == 0:
-                print(f"Ep{ep+1:3d} | Tr L={tl:.4f} A={ta:.4f} | Va L={vl:.4f} A={va:.4f} AUC={vau:.4f}")
+                print(f"  Ep{ep+1:3d} | Tr L={tl:.4f} A={ta:.4f} | Va L={vl:.4f} A={va:.4f} AUC={vau:.4f}")
             if vau > self.best_auc + 0.001:
                 self.best_auc = vau; self.patience = 0
                 self.ema.apply(); torch.save(self.model.state_dict(), f"{self.fold_dir}/best.pth"); self.ema.restore()
             else:
                 self.patience += 1
-                if self.patience >= 20: print(f"  EarlyStop"); break
+                if self.patience >= 20: print(f"  EarlyStop @ ep{ep+1}"); break
 
     def load_best(self):
         self.model.load_state_dict(torch.load(f"{self.fold_dir}/best.pth", map_location=DEVICE))
@@ -213,7 +229,8 @@ class Trainer:
 # ==========================================
 random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
 
-print(f"Light 3D CNN | {n_params:,} params | {FINAL_SIZE} | Batch={BATCH_SIZE}")
+print("=" * 60)
+print(f"Light 3D CNN | {n_params:,} params | Size={FINAL_SIZE} | Batch={BATCH_SIZE}")
 print("=" * 60)
 
 fold_results = []
@@ -223,10 +240,12 @@ for fold in range(N_FOLDS):
     fold_dir = f"{OUTPUT_DIR}/fold{fold+1}"
     os.makedirs(fold_dir, exist_ok=True)
 
+    # Stratified splits
     skf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
     splits = list(skf.split(files, labels))
     te_f = [files[i] for i in splits[fold][1]]; te_l = [labels[i] for i in splits[fold][1]]
     tv_f = [files[i] for i in splits[fold][0]]; tv_l = [labels[i] for i in splits[fold][0]]
+
     tr_f, va_f, tr_l, va_l = train_test_split(tv_f, tv_l, test_size=0.18, stratify=tv_l, random_state=SEED)
     print(f"Train={len(tr_f)} Val={len(va_f)} Test={len(te_f)}")
 
@@ -252,4 +271,4 @@ print(f"\n{'='*60}")
 accs = [r["acc"] for r in fold_results]
 aucs = [r["auc"] for r in fold_results]
 print(f"5-Fold | Acc: {np.mean(accs):.4f} ± {np.std(accs):.4f} | AUC: {np.mean(aucs):.4f} ± {np.std(aucs):.4f}")
-print(f"Done: {OUTPUT_DIR}")
+print(f"Results: {OUTPUT_DIR}")
