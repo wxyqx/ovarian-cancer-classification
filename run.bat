@@ -1,1 +1,0 @@
-cd e:\wxxyq; python -u train_local.py 2>&1
