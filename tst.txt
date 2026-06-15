@@ -1,3 +1,7 @@
+# Cell 1: 装依赖（单独一个cell）
+!pip install monai -q
+
+# Cell 2: 训练（复制下面全部）
 import os, random, warnings
 warnings.filterwarnings("ignore")
 
@@ -15,21 +19,23 @@ from monai.transforms import (
     NormalizeIntensityd, EnsureTyped,
 )
 
+# ============ 配置 ============
 DATA_DIR = "/kaggle/input/datasets/aaaxxxiii/luachao/卵巢癌数据"
 OUTPUT_DIR = "/kaggle/working/outputs"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 MIN_HU, MAX_HU = -160, 240
-FINAL_SIZE = (96, 96, 32)
-BATCH_SIZE = 4
+FINAL_SIZE = (96, 96, 32)   # 大一点，保留更多细节
+BATCH_SIZE = 4               # 小batch利于泛化
 NUM_EPOCHS = 100
-LR = 1e-4
+LR = 1e-4                    # 保守学习率
 N_FOLDS = 5
 SEED = 42
 assert torch.cuda.is_available(), "CUDA NOT AVAILABLE! Please enable GPU in Kaggle Accelerator settings."
 DEVICE = "cuda"
 print(f"Device: {DEVICE}")
 
+# ============ 预处理（只保留温和增强） ============
 def make_transforms(aug):
     base = [
         LoadImaged(keys=["image"], image_only=True, ensure_channel_first=True),
@@ -38,6 +44,7 @@ def make_transforms(aug):
         Resized(keys=["image"], spatial_size=FINAL_SIZE, mode="trilinear"),
     ]
     if aug:
+        # 只保留最基础的增强，不破坏医学信号
         base += [
             RandFlipd(keys=["image"], prob=0.5, spatial_axis=[0]),
             RandFlipd(keys=["image"], prob=0.5, spatial_axis=[1]),
@@ -47,6 +54,7 @@ def make_transforms(aug):
     base += [NormalizeIntensityd(keys=["image"], nonzero=True), EnsureTyped(keys=["image"], dtype=np.float32)]
     return Compose(base)
 
+# ============ 数据集 ============
 class CTDataset(Dataset):
     def __init__(self, flist, labs, aug=False):
         self.flist, self.labs = flist, labs
@@ -60,6 +68,7 @@ class CTDataset(Dataset):
         else: img = img.float()
         return img, torch.tensor(self.labs[i], dtype=torch.long)
 
+# 加载
 df = pd.read_csv(os.path.join(DATA_DIR, "patient_label.csv"))
 df["id"] = df["id"].astype(str)
 lmap = dict(zip(df["id"], df["label"]))
@@ -73,37 +82,46 @@ for fp in nii_files:
     files.append(fp); labels.append(int(lmap[pid]) - 1)
 print(f"Samples: {len(files)} (Neg={labels.count(0)} Pos={labels.count(1)})")
 
+# ============ 3D CNN with Residual ============
 class ResBlock3D(nn.Module):
     def __init__(self, c):
         super().__init__()
-        self.c1 = nn.Conv3d(c, c, 3, padding=1); self.g1 = nn.GroupNorm(min(8,c), c)
-        self.c2 = nn.Conv3d(c, c, 3, padding=1); self.g2 = nn.GroupNorm(min(8,c), c)
-    def forward(self, x): return F.relu(self.g2(self.c2(F.relu(self.g1(self.c1(x)))))) + x
+        self.conv1 = nn.Conv3d(c, c, 3, padding=1); self.gn1 = nn.GroupNorm(min(8,c), c)
+        self.conv2 = nn.Conv3d(c, c, 3, padding=1); self.gn2 = nn.GroupNorm(min(8,c), c)
+    def forward(self, x): return F.relu(self.gn2(self.conv2(F.relu(self.gn1(self.conv1(x)))))) + x
 
 class Res3DCNN(nn.Module):
     def __init__(self):
         super().__init__()
+        # stem
         self.stem = nn.Sequential(nn.Conv3d(1, 32, 3, padding=1), nn.GroupNorm(8, 32), nn.ReLU())
+        # stage1: 32→32, 96^3
         self.s1 = nn.Sequential(ResBlock3D(32), ResBlock3D(32))
-        self.d1 = nn.Sequential(nn.Conv3d(32, 64, 3, stride=2, padding=1), nn.GroupNorm(8, 64), nn.ReLU())
+        # stage2: 32→64, 48^3
+        self.down1 = nn.Sequential(nn.Conv3d(32, 64, 3, stride=2, padding=1), nn.GroupNorm(8, 64), nn.ReLU())
         self.s2 = nn.Sequential(ResBlock3D(64), ResBlock3D(64))
-        self.d2 = nn.Sequential(nn.Conv3d(64, 128, 3, stride=2, padding=1), nn.GroupNorm(8, 128), nn.ReLU())
+        # stage3: 64→128, 24^3
+        self.down2 = nn.Sequential(nn.Conv3d(64, 128, 3, stride=2, padding=1), nn.GroupNorm(8, 128), nn.ReLU())
         self.s3 = nn.Sequential(ResBlock3D(128), ResBlock3D(128))
-        self.d3 = nn.Sequential(nn.Conv3d(128, 128, 3, stride=2, padding=1), nn.GroupNorm(8, 128), nn.ReLU())
+        # stage4: 128→128, 12^3
+        self.down3 = nn.Sequential(nn.Conv3d(128, 128, 3, stride=2, padding=1), nn.GroupNorm(8, 128), nn.ReLU())
         self.s4 = nn.Sequential(ResBlock3D(128), ResBlock3D(128))
+        # head
         self.pool = nn.AdaptiveAvgPool3d((1,1,1))
         self.head = nn.Sequential(nn.Dropout(0.4), nn.Linear(128, 2))
+
     def forward(self, x):
         x = self.stem(x)
-        x = self.s1(x); x = self.d1(x)
-        x = self.s2(x); x = self.d2(x)
-        x = self.s3(x); x = self.d3(x)
+        x = self.s1(x); x = self.down1(x)
+        x = self.s2(x); x = self.down2(x)
+        x = self.s3(x); x = self.down3(x)
         x = self.s4(x)
         return self.head(self.pool(x).view(x.size(0), -1))
 
 n_params = sum(p.numel() for p in Res3DCNN().parameters())
 print(f"Params: {n_params:,}")
 
+# ============ EMA ============
 class EMA:
     def __init__(self, m, d=0.999):
         self.m, self.d = m, d
@@ -119,6 +137,7 @@ class EMA:
         for n, p in self.m.named_parameters():
             if p.requires_grad: p.data = self.bk[n]
 
+# ============ Trainer ============
 class Trainer:
     def __init__(self, mdl, fdir):
         self.mdl = mdl.to(DEVICE)
@@ -162,32 +181,36 @@ class Trainer:
 
     def load(self): self.mdl.load_state_dict(torch.load(f"{self.fdir}/best.pth", map_location=DEVICE))
 
+# ============ 5-Fold CV ============
 random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
-print(f"Res3DCNN | {n_params:,} params | {FINAL_SIZE}")
-print("="*50)
+print(f"\nRes3DCNN | {n_params:,} params | {FINAL_SIZE}\n"+"="*50)
 
 res = []
 for fold in range(N_FOLDS):
     print(f"\nFold {fold+1}/{N_FOLDS}")
     fd = f"{OUTPUT_DIR}/f{fold+1}"; os.makedirs(fd, exist_ok=True)
+
     skf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
     sp = list(skf.split(files, labels))
     te_f = [files[i] for i in sp[fold][1]]; te_l = [labels[i] for i in sp[fold][1]]
     tv_f = [files[i] for i in sp[fold][0]]; tv_l = [labels[i] for i in sp[fold][0]]
     tr_f, va_f, tr_l, va_l = train_test_split(tv_f, tv_l, test_size=0.18, stratify=tv_l, random_state=SEED)
     print(f"Train={len(tr_f)} Val={len(va_f)} Test={len(te_f)}")
+
     tr_dl = DataLoader(CTDataset(tr_f, tr_l, True), BATCH_SIZE, shuffle=True, num_workers=2, pin_memory=True)
     va_dl = DataLoader(CTDataset(va_f, va_l, False), BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True)
     te_dl = DataLoader(CTDataset(te_f, te_l, False), BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True)
+
     t = Trainer(Res3DCNN(), fd)
     t.fit(tr_dl, va_dl, NUM_EPOCHS); t.load()
     _, acc, auc, preds, lbls, probs = t.run(te_dl, False)
     print(f"  >> TEST Acc={acc:.4f} AUC={auc:.4f}")
     res.append({"acc": acc, "auc": auc})
+
     pd.DataFrame({"file":[os.path.basename(f) for f in te_f],"true":lbls,"pred":preds,"p0":probs[:,0],"p1":probs[:,1]}).to_csv(f"{fd}/preds.csv", index=False)
 
 print(f"\n{'='*50}")
 accs, aucs = [r["acc"] for r in res], [r["auc"] for r in res]
-print(f"Acc: {np.mean(accs):.4f} +- {np.std(accs):.4f}")
-print(f"AUC: {np.mean(aucs):.4f} +- {np.std(aucs):.4f}")
+print(f"Acc: {np.mean(accs):.4f} ± {np.std(accs):.4f}")
+print(f"AUC: {np.mean(aucs):.4f} ± {np.std(aucs):.4f}")
 print(f"Done: {OUTPUT_DIR}")
